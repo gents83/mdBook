@@ -241,6 +241,72 @@ pub fn get_404_output_file(input_404: &Option<String>) -> String {
         .replace(".md", ".html")
 }
 
+/// This will allow to make even external path relative to the current book position
+/// shortening to the most common root found between paths
+///
+/// So as example between 2 paths
+/// src:    root/a_folder/b_folder/c_folder/file.md
+/// other:  root/a_folder/d_folder/other.md
+/// result: d_folder/other.md
+///
+/// As example imagine to have following folder structure
+///
+/// root/
+/// root/my_folder/
+/// root/my_folder/doc/
+/// root/my_folder/doc/summary.md
+/// root/additional_doc/
+/// root/additional_doc/other.md
+/// root/additional_doc/nested/nested.md
+/// root/more_doc/
+/// root/more_doc/more.md
+///
+/// This will result in creating a book with following folder hierarchy:
+///
+/// root/my_folder/doc/book/summary.html
+/// root/my_folder/doc/book/additional_doc/other.md
+/// root/my_folder/doc/book/additional_doc/nested/nested.md
+/// root/my_folder/doc/book/more_doc/more.md
+///
+/// It's used both in book chapters and in summary links
+///
+pub fn make_relative_to<P1: AsRef<Path> + ?Sized, P2: AsRef<Path> + ?Sized>(
+    src: &P1,
+    other: &P2,
+) -> Result<PathBuf> {
+    let src_location = src
+        .as_ref()
+        .canonicalize()
+        .with_context(|| format!("Path not found, {}", src.as_ref().display()))?;
+    let other_location = other
+        .as_ref()
+        .canonicalize()
+        .with_context(|| format!("Path not found, {}", other.as_ref().display()))?;
+
+    if let Ok(stripped) = other_location.strip_prefix(&src_location) {
+        Ok(stripped.to_path_buf())
+    } else {
+        let src = src_location.to_str().unwrap_or_default().to_string();
+        let other = other_location.to_str().unwrap_or_default().to_string();
+        let src_path = src.to_string();
+        let mut other_path = other.to_string();
+        let mut index = 0;
+        let md_path_bytes = other_path.as_bytes();
+        let src_path_bytes = src_path.as_bytes();
+        while index < md_path_bytes.len() {
+            if index < src_path.len() && md_path_bytes[index] == src_path_bytes[index] {
+                index += 1;
+            } else {
+                break;
+            }
+        }
+        for _ in 0..index {
+            other_path.remove(0);
+        }
+        Ok(PathBuf::from(other_path.replace('\\', "/")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::copy_files_except_ext;

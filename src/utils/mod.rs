@@ -3,7 +3,7 @@
 pub mod fs;
 mod string;
 pub(crate) mod toml_ext;
-use crate::errors::Error;
+use crate::{errors::Error, utils::fs::make_relative_to};
 use log::error;
 use once_cell::sync::Lazy;
 use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag};
@@ -92,12 +92,20 @@ pub fn unique_id_from_content(content: &str, id_counter: &mut HashMap<String, us
 /// page go to the original location. Normal page rendering sets `path` to
 /// None. Ideally, print page links would link to anchors on the print page,
 /// but that is very difficult.
-fn adjust_links<'a>(event: Event<'a>, path: Option<&Path>) -> Event<'a> {
+fn adjust_links<'a, P: AsRef<Path> + ?Sized>(
+    event: Event<'a>,
+    output_path: &P,
+    path: Option<&Path>,
+) -> Event<'a> {
     static SCHEME_LINK: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-z][a-z0-9+.-]*:").unwrap());
     static MD_LINK: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"(?P<link>.*)\.md(?P<anchor>#.*)?").unwrap());
 
-    fn fix<'a>(dest: CowStr<'a>, path: Option<&Path>) -> CowStr<'a> {
+    fn fix<'a, P: AsRef<Path> + ?Sized>(
+        dest: CowStr<'a>,
+        output_path: &P,
+        path: Option<&Path>,
+    ) -> CowStr<'a> {
         if dest.starts_with('#') {
             // Fragment-only link.
             if let Some(path) = path {
@@ -126,7 +134,19 @@ fn adjust_links<'a>(event: Event<'a>, path: Option<&Path>) -> Event<'a> {
             }
 
             if let Some(caps) = MD_LINK.captures(&dest) {
-                fixed_link.push_str(&caps["link"]);
+                let mut md_path = String::from(&caps["link"]);
+
+                md_path.push_str(".md");
+                let src_dir = output_path
+                    .as_ref()
+                    .parent()
+                    .unwrap_or(output_path.as_ref());
+                if let Ok(link) = make_relative_to(src_dir, &src_dir.join(&md_path)) {
+                    md_path = link.to_str().unwrap().to_string();
+                }
+                md_path = md_path.replace(".md", "");
+
+                fixed_link.push_str(&md_path);
                 fixed_link.push_str(".html");
                 if let Some(anchor) = caps.name("anchor") {
                     fixed_link.push_str(anchor.as_str());
@@ -139,7 +159,11 @@ fn adjust_links<'a>(event: Event<'a>, path: Option<&Path>) -> Event<'a> {
         dest
     }
 
-    fn fix_html<'a>(html: CowStr<'a>, path: Option<&Path>) -> CowStr<'a> {
+    fn fix_html<'a, P: AsRef<Path> + ?Sized>(
+        html: CowStr<'a>,
+        output_path: &P,
+        path: Option<&Path>,
+    ) -> CowStr<'a> {
         // This is a terrible hack, but should be reasonably reliable. Nobody
         // should ever parse a tag with a regex. However, there isn't anything
         // in Rust that I know of that is suitable for handling partial html
@@ -153,7 +177,7 @@ fn adjust_links<'a>(event: Event<'a>, path: Option<&Path>) -> Event<'a> {
 
         HTML_LINK
             .replace_all(&html, |caps: &regex::Captures<'_>| {
-                let fixed = fix(caps[2].into(), path);
+                let fixed = fix(caps[2].into(), output_path, path);
                 format!("{}{}\"", &caps[1], fixed)
             })
             .into_owned()
@@ -162,19 +186,23 @@ fn adjust_links<'a>(event: Event<'a>, path: Option<&Path>) -> Event<'a> {
 
     match event {
         Event::Start(Tag::Link(link_type, dest, title)) => {
-            Event::Start(Tag::Link(link_type, fix(dest, path), title))
+            Event::Start(Tag::Link(link_type, fix(dest, output_path, path), title))
         }
         Event::Start(Tag::Image(link_type, dest, title)) => {
-            Event::Start(Tag::Image(link_type, fix(dest, path), title))
+            Event::Start(Tag::Image(link_type, fix(dest, output_path, path), title))
         }
-        Event::Html(html) => Event::Html(fix_html(html, path)),
+        Event::Html(html) => Event::Html(fix_html(html, output_path, path)),
         _ => event,
     }
 }
 
 /// Wrapper around the pulldown-cmark parser for rendering markdown to HTML.
-pub fn render_markdown(text: &str, curly_quotes: bool) -> String {
-    render_markdown_with_path(text, curly_quotes, None)
+pub fn render_markdown<P: AsRef<Path> + ?Sized>(
+    text: &str,
+    curly_quotes: bool,
+    output_path: &P,
+) -> String {
+    render_markdown_with_path(text, curly_quotes, output_path, None)
 }
 
 pub fn new_cmark_parser(text: &str, curly_quotes: bool) -> Parser<'_, '_> {
@@ -190,12 +218,17 @@ pub fn new_cmark_parser(text: &str, curly_quotes: bool) -> Parser<'_, '_> {
     Parser::new_ext(text, opts)
 }
 
-pub fn render_markdown_with_path(text: &str, curly_quotes: bool, path: Option<&Path>) -> String {
+pub fn render_markdown_with_path<P: AsRef<Path> + ?Sized>(
+    text: &str,
+    curly_quotes: bool,
+    output_path: &P,
+    path: Option<&Path>,
+) -> String {
     let mut s = String::with_capacity(text.len() * 3 / 2);
     let p = new_cmark_parser(text, curly_quotes);
     let events = p
         .map(clean_codeblock_headers)
-        .map(|event| adjust_links(event, path))
+        .map(|event| adjust_links(event, output_path, path))
         .flat_map(|event| {
             let (a, b) = wrap_tables(event);
             a.into_iter().chain(b)
@@ -270,7 +303,7 @@ mod tests {
         #[test]
         fn preserves_external_links() {
             assert_eq!(
-                render_markdown("[example](https://www.rust-lang.org/)", false),
+                render_markdown("[example](https://www.rust-lang.org/)", false, "./book/"),
                 "<p><a href=\"https://www.rust-lang.org/\">example</a></p>\n"
             );
         }
@@ -278,17 +311,17 @@ mod tests {
         #[test]
         fn it_can_adjust_markdown_links() {
             assert_eq!(
-                render_markdown("[example](example.md)", false),
+                render_markdown("[example](example.md)", false, "./book/"),
                 "<p><a href=\"example.html\">example</a></p>\n"
             );
             assert_eq!(
-                render_markdown("[example_anchor](example.md#anchor)", false),
+                render_markdown("[example_anchor](example.md#anchor)", false, "./book/"),
                 "<p><a href=\"example.html#anchor\">example_anchor</a></p>\n"
             );
 
             // this anchor contains 'md' inside of it
             assert_eq!(
-                render_markdown("[phantom data](foo.html#phantomdata)", false),
+                render_markdown("[phantom data](foo.html#phantomdata)", false, "./book/"),
                 "<p><a href=\"foo.html#phantomdata\">phantom data</a></p>\n"
             );
         }
@@ -306,12 +339,12 @@ mod tests {
 </tbody></table>
 </div>
 "#.trim();
-            assert_eq!(render_markdown(src, false), out);
+            assert_eq!(render_markdown(src, false, "./book/"), out);
         }
 
         #[test]
         fn it_can_keep_quotes_straight() {
-            assert_eq!(render_markdown("'one'", false), "<p>'one'</p>\n");
+            assert_eq!(render_markdown("'one'", false, "./book/"), "<p>'one'</p>\n");
         }
 
         #[test]
@@ -327,7 +360,7 @@ mod tests {
 </code></pre>
 <p><code>'three'</code> ‘four’</p>
 "#;
-            assert_eq!(render_markdown(input, true), expected);
+            assert_eq!(render_markdown(input, true, "./book/"), expected);
         }
 
         #[test]
@@ -349,8 +382,8 @@ more text with spaces
 </code></pre>
 <p>more text with spaces</p>
 "#;
-            assert_eq!(render_markdown(input, false), expected);
-            assert_eq!(render_markdown(input, true), expected);
+            assert_eq!(render_markdown(input, false, "./book/"), expected);
+            assert_eq!(render_markdown(input, true, "./book/"), expected);
         }
 
         #[test]
@@ -362,8 +395,8 @@ more text with spaces
 
             let expected = r#"<pre><code class="language-rust,no_run,should_panic,property_3"></code></pre>
 "#;
-            assert_eq!(render_markdown(input, false), expected);
-            assert_eq!(render_markdown(input, true), expected);
+            assert_eq!(render_markdown(input, false, "./book/"), expected);
+            assert_eq!(render_markdown(input, true, "./book/"), expected);
         }
 
         #[test]
@@ -375,8 +408,8 @@ more text with spaces
 
             let expected = r#"<pre><code class="language-rust,,,,,no_run,,,should_panic,,,,property_3"></code></pre>
 "#;
-            assert_eq!(render_markdown(input, false), expected);
-            assert_eq!(render_markdown(input, true), expected);
+            assert_eq!(render_markdown(input, false, "./book/"), expected);
+            assert_eq!(render_markdown(input, true, "./book/"), expected);
         }
 
         #[test]
@@ -388,15 +421,15 @@ more text with spaces
 
             let expected = r#"<pre><code class="language-rust"></code></pre>
 "#;
-            assert_eq!(render_markdown(input, false), expected);
-            assert_eq!(render_markdown(input, true), expected);
+            assert_eq!(render_markdown(input, false, "./book/"), expected);
+            assert_eq!(render_markdown(input, true, "./book/"), expected);
 
             let input = r#"
 ```rust
 ```
 "#;
-            assert_eq!(render_markdown(input, false), expected);
-            assert_eq!(render_markdown(input, true), expected);
+            assert_eq!(render_markdown(input, false, "./book/"), expected);
+            assert_eq!(render_markdown(input, true, "./book/"), expected);
         }
     }
 

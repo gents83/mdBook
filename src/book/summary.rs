@@ -1,4 +1,5 @@
 use crate::errors::*;
+use crate::utils::fs::make_relative_to;
 use log::{debug, trace, warn};
 use memchr::{self, Memchr};
 use pulldown_cmark::{self, Event, HeadingLevel, Tag};
@@ -68,6 +69,33 @@ pub struct Summary {
     pub suffix_chapters: Vec<SummaryItem>,
 }
 
+impl Summary {
+    fn make_chapter_paths_relative(chapters: &mut [SummaryItem], src_dir: &Path) {
+        chapters.iter_mut().for_each(|item| {
+            if let SummaryItem::Link(Link {
+                name: _,
+                filepath,
+                location: Some(ref mut location),
+                number: _,
+                nested_items,
+            }) = item
+            {
+                *filepath = src_dir.join(location.as_path());
+                *location = make_relative_to(src_dir, filepath).unwrap_or(location.clone());
+                Self::make_chapter_paths_relative(nested_items, src_dir);
+            }
+        });
+    }
+
+    /// This will allow to make even external path relative to the current src dir
+    /// shortening to the most common root found between paths
+    pub fn make_paths_relative_to(&mut self, src_dir: &Path) {
+        Self::make_chapter_paths_relative(&mut self.prefix_chapters, src_dir);
+        Self::make_chapter_paths_relative(&mut self.numbered_chapters, src_dir);
+        Self::make_chapter_paths_relative(&mut self.suffix_chapters, src_dir);
+    }
+}
+
 /// A struct representing an entry in the `SUMMARY.md`, possibly with nested
 /// entries.
 ///
@@ -76,6 +104,8 @@ pub struct Summary {
 pub struct Link {
     /// The name of the chapter.
     pub name: String,
+    /// The filepath of the chapter's source file,
+    pub filepath: PathBuf,
     /// The location of the chapter's source file, taking the book's `src`
     /// directory as the root.
     pub location: Option<PathBuf>,
@@ -87,12 +117,16 @@ pub struct Link {
 
 impl Link {
     /// Create a new link with no nested items.
-    pub fn new<S: Into<String>, P: AsRef<Path>>(name: S, location: P) -> Link {
+    pub fn new<S: Into<String>, P1: AsRef<Path>, P2: AsRef<Path>>(
+        name: S,
+        src_dir: P1,
+        location: P2,
+    ) -> Link {
         Link {
             name: name.into(),
             location: Some(location.as_ref().to_path_buf()),
-            number: None,
-            nested_items: Vec::new(),
+            filepath: src_dir.as_ref().join(location.as_ref()),
+            ..Default::default()
         }
     }
 }
@@ -101,6 +135,7 @@ impl Default for Link {
     fn default() -> Self {
         Link {
             name: String::new(),
+            filepath: PathBuf::new(),
             location: Some(PathBuf::new()),
             number: None,
             nested_items: Vec::new(),
@@ -348,8 +383,7 @@ impl<'a> SummaryParser<'a> {
         Link {
             name,
             location: path,
-            number: None,
-            nested_items: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -782,14 +816,15 @@ mod tests {
                     name: String::from("Nested"),
                     location: Some(PathBuf::from("./nested.md")),
                     number: Some(SectionNumber(vec![1, 1])),
-                    nested_items: Vec::new(),
+                    ..Default::default()
                 })],
+                ..Default::default()
             }),
             SummaryItem::Link(Link {
                 name: String::from("Second"),
                 location: Some(PathBuf::from("./second.md")),
                 number: Some(SectionNumber(vec![2])),
-                nested_items: Vec::new(),
+                ..Default::default()
             }),
         ];
 
@@ -810,13 +845,13 @@ mod tests {
                 name: String::from("First"),
                 location: Some(PathBuf::from("./first.md")),
                 number: Some(SectionNumber(vec![1])),
-                nested_items: Vec::new(),
+                ..Default::default()
             }),
             SummaryItem::Link(Link {
                 name: String::from("Second"),
                 location: Some(PathBuf::from("./second.md")),
                 number: Some(SectionNumber(vec![2])),
-                nested_items: Vec::new(),
+                ..Default::default()
             }),
         ];
 
@@ -838,13 +873,13 @@ mod tests {
                 name: String::from("First"),
                 location: Some(PathBuf::from("./first.md")),
                 number: Some(SectionNumber(vec![1])),
-                nested_items: Vec::new(),
+                ..Default::default()
             }),
             SummaryItem::Link(Link {
                 name: String::from("Second"),
                 location: Some(PathBuf::from("./second.md")),
                 number: Some(SectionNumber(vec![2])),
-                nested_items: Vec::new(),
+                ..Default::default()
             }),
             SummaryItem::PartTitle(String::from("Title 2")),
             SummaryItem::Link(Link {
@@ -855,8 +890,9 @@ mod tests {
                     name: String::from("Fourth"),
                     location: Some(PathBuf::from("./fourth.md")),
                     number: Some(SectionNumber(vec![3, 1])),
-                    nested_items: Vec::new(),
+                    ..Default::default()
                 })],
+                ..Default::default()
             }),
         ];
 
@@ -878,13 +914,13 @@ mod tests {
                 name: String::from("First"),
                 location: Some(PathBuf::from("./first.md")),
                 number: Some(SectionNumber(vec![1])),
-                nested_items: Vec::new(),
+                ..Default::default()
             }),
             SummaryItem::Link(Link {
                 name: String::from("Second"),
                 location: Some(PathBuf::from("./second.md")),
                 number: Some(SectionNumber(vec![2])),
-                nested_items: Vec::new(),
+                ..Default::default()
             }),
         ];
 
@@ -906,7 +942,7 @@ mod tests {
             name: String::from("Empty"),
             location: None,
             number: Some(SectionNumber(vec![1])),
-            nested_items: Vec::new(),
+            ..Default::default()
         })];
 
         assert!(got.is_ok());
@@ -924,21 +960,21 @@ mod tests {
                 name: String::from("First"),
                 location: Some(PathBuf::from("./first.md")),
                 number: Some(SectionNumber(vec![1])),
-                nested_items: Vec::new(),
+                ..Default::default()
             }),
             SummaryItem::Separator,
             SummaryItem::Link(Link {
                 name: String::from("Second"),
                 location: Some(PathBuf::from("./second.md")),
                 number: Some(SectionNumber(vec![2])),
-                nested_items: Vec::new(),
+                ..Default::default()
             }),
             SummaryItem::Separator,
             SummaryItem::Link(Link {
                 name: String::from("Third"),
                 location: Some(PathBuf::from("./third.md")),
                 number: Some(SectionNumber(vec![3])),
-                nested_items: Vec::new(),
+                ..Default::default()
             }),
         ];
 
@@ -959,7 +995,7 @@ mod tests {
             name: String::from("Chapter title"),
             location: Some(PathBuf::from("./chapter.md")),
             number: Some(SectionNumber(vec![1])),
-            nested_items: Vec::new(),
+            ..Default::default()
         })];
 
         let mut parser = SummaryParser::new(src);
@@ -978,13 +1014,13 @@ mod tests {
                 name: String::from("test1"),
                 location: Some(PathBuf::from("./test link1.md")),
                 number: Some(SectionNumber(vec![1])),
-                nested_items: Vec::new(),
+                ..Default::default()
             }),
             SummaryItem::Link(Link {
                 name: String::from("test2"),
                 location: Some(PathBuf::from("./test link2.md")),
                 number: Some(SectionNumber(vec![2])),
-                nested_items: Vec::new(),
+                ..Default::default()
             }),
         ];
         let mut parser = SummaryParser::new(src);
@@ -1068,6 +1104,7 @@ mod tests {
                 location: Some(PathBuf::from(location)),
                 number: Some(SectionNumber(numbers.to_vec())),
                 nested_items,
+                ..Default::default()
             })
         };
 

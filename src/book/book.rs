@@ -24,14 +24,14 @@ pub fn load_book<P: AsRef<Path>>(src_dir: P, cfg: &BuildConfig) -> Result<Book> 
 
     let preprocessed_summary_content = SummaryPreprocessor::resolve(src_dir, &summary_content);
 
-    let summary = parse_summary(&preprocessed_summary_content)
+    let mut summary = parse_summary(&preprocessed_summary_content)
         .with_context(|| format!("Summary parsing failed for file={:?}", summary_md))?;
 
     if cfg.create_missing {
         create_missing(src_dir, &summary).with_context(|| "Unable to create missing chapters")?;
     }
 
-    load_book_from_disk(&summary, src_dir)
+    load_book_from_disk(&mut summary, src_dir)
 }
 
 fn create_missing(src_dir: &Path, summary: &Summary) -> Result<()> {
@@ -172,18 +172,18 @@ pub struct Chapter {
 
 impl Chapter {
     /// Create a new chapter with the provided content.
-    pub fn new<P: Into<PathBuf>>(
+    pub fn new<P1: Into<PathBuf>, P2: Into<PathBuf>>(
         name: &str,
         content: String,
-        p: P,
+        path: P1,
+        filepath: P2,
         parent_names: Vec<String>,
     ) -> Chapter {
-        let path: PathBuf = p.into();
         Chapter {
             name: name.to_string(),
             content,
-            path: Some(path.clone()),
-            source_path: Some(path),
+            path: Some(path.into()),
+            source_path: Some(filepath.into()),
             parent_names,
             ..Default::default()
         }
@@ -212,9 +212,13 @@ impl Chapter {
 ///
 /// You need to pass in the book's source directory because all the links in
 /// `SUMMARY.md` give the chapter locations relative to it.
-pub(crate) fn load_book_from_disk<P: AsRef<Path>>(summary: &Summary, src_dir: P) -> Result<Book> {
+pub(crate) fn load_book_from_disk<P: AsRef<Path>>(
+    summary: &mut Summary,
+    src_dir: P,
+) -> Result<Book> {
     debug!("Loading the book from disk");
     let src_dir = src_dir.as_ref();
+    summary.make_paths_relative_to(src_dir);
 
     let prefix = summary.prefix_chapters.iter();
     let numbered = summary.numbered_chapters.iter();
@@ -256,29 +260,31 @@ fn load_chapter<P: AsRef<Path>>(
     let mut ch = if let Some(ref link_location) = link.location {
         debug!("Loading {} ({})", link.name, link_location.display());
 
-        let location = if link_location.is_absolute() {
-            link_location.clone()
-        } else {
-            src_dir.join(link_location)
-        };
-
-        let mut f = File::open(&location)
+        let mut f = File::open(&link.filepath)
             .with_context(|| format!("Chapter file not found, {}", link_location.display()))?;
 
         let mut content = String::new();
         f.read_to_string(&mut content).with_context(|| {
-            format!("Unable to read \"{}\" ({})", link.name, location.display())
+            format!(
+                "Unable to read \"{}\" ({})",
+                link.name,
+                link_location.display()
+            )
         })?;
 
         if content.as_bytes().starts_with(b"\xef\xbb\xbf") {
             content.replace_range(..3, "");
         }
 
-        let stripped = location
-            .strip_prefix(src_dir)
-            .expect("Chapters are always inside a book");
-
-        Chapter::new(&link.name, content, stripped, parent_names.clone())
+        Chapter::new(
+            &link.name,
+            content,
+            link_location,
+            link.filepath
+                .canonicalize()
+                .unwrap_or(link.filepath.clone()),
+            parent_names.clone(),
+        )
     } else {
         Chapter::new_draft(&link.name, parent_names.clone())
     };
@@ -355,13 +361,15 @@ And here is some \
     fn dummy_link() -> (Link, TempDir) {
         let temp = TempFileBuilder::new().prefix("book").tempdir().unwrap();
 
-        let chapter_path = temp.path().join("chapter_1.md");
-        File::create(&chapter_path)
+        let chapter_path = PathBuf::from("chapter_1.md");
+        let source_path = temp.path().join(&chapter_path);
+
+        File::create(source_path)
             .unwrap()
             .write_all(DUMMY_SRC.as_bytes())
             .unwrap();
 
-        let link = Link::new("Chapter 1", chapter_path);
+        let link = Link::new("Chapter 1", temp.path(), chapter_path);
 
         (link, temp)
     }
@@ -370,14 +378,15 @@ And here is some \
     fn nested_links() -> (Link, TempDir) {
         let (mut root, temp_dir) = dummy_link();
 
-        let second_path = temp_dir.path().join("second.md");
+        let second_path = PathBuf::from("second.md");
+        let source_path = temp_dir.path().join(&second_path);
 
-        File::create(&second_path)
+        File::create(source_path)
             .unwrap()
             .write_all(b"Hello World!")
             .unwrap();
 
-        let mut second = Link::new("Nested Chapter 1", &second_path);
+        let mut second = Link::new("Nested Chapter 1", temp_dir.path(), &second_path);
         second.number = Some(SectionNumber(vec![1, 2]));
 
         root.nested_items.push(second.clone().into());
@@ -390,10 +399,12 @@ And here is some \
     #[test]
     fn load_a_single_chapter_from_disk() {
         let (link, temp_dir) = dummy_link();
+        let filepath = temp_dir.path().join(PathBuf::from("chapter_1.md"));
         let should_be = Chapter::new(
             "Chapter 1",
             DUMMY_SRC.to_string(),
             "chapter_1.md",
+            filepath.canonicalize().unwrap(),
             Vec::new(),
         );
 
@@ -405,18 +416,21 @@ And here is some \
     fn load_a_single_chapter_with_utf8_bom_from_disk() {
         let temp_dir = TempFileBuilder::new().prefix("book").tempdir().unwrap();
 
-        let chapter_path = temp_dir.path().join("chapter_1.md");
-        File::create(&chapter_path)
+        let chapter_path = PathBuf::from("chapter_1.md");
+        let source_path = temp_dir.path().join(&chapter_path);
+
+        File::create(&source_path)
             .unwrap()
             .write_all(("\u{feff}".to_owned() + DUMMY_SRC).as_bytes())
             .unwrap();
 
-        let link = Link::new("Chapter 1", chapter_path);
+        let link = Link::new("Chapter 1", temp_dir.path(), chapter_path);
 
         let should_be = Chapter::new(
             "Chapter 1",
             DUMMY_SRC.to_string(),
             "chapter_1.md",
+            source_path.canonicalize().unwrap(),
             Vec::new(),
         );
 
@@ -426,7 +440,7 @@ And here is some \
 
     #[test]
     fn cant_load_a_nonexistent_chapter() {
-        let link = Link::new("Chapter 1", "/foo/bar/baz.md");
+        let link = Link::new("Chapter 1", "", "/foo/bar/baz.md");
 
         let got = load_chapter(&link, "", Vec::new());
         assert!(got.is_err());
@@ -441,7 +455,12 @@ And here is some \
             content: String::from("Hello World!"),
             number: Some(SectionNumber(vec![1, 2])),
             path: Some(PathBuf::from("second.md")),
-            source_path: Some(PathBuf::from("second.md")),
+            source_path: Some(
+                temp.path()
+                    .join(PathBuf::from("second.md"))
+                    .canonicalize()
+                    .unwrap(),
+            ),
             parent_names: vec![String::from("Chapter 1")],
             sub_items: Vec::new(),
         };
@@ -450,7 +469,12 @@ And here is some \
             content: String::from(DUMMY_SRC),
             number: None,
             path: Some(PathBuf::from("chapter_1.md")),
-            source_path: Some(PathBuf::from("chapter_1.md")),
+            source_path: Some(
+                temp.path()
+                    .join(PathBuf::from("chapter_1.md"))
+                    .canonicalize()
+                    .unwrap(),
+            ),
             parent_names: Vec::new(),
             sub_items: vec![
                 BookItem::Chapter(nested.clone()),
@@ -466,7 +490,7 @@ And here is some \
     #[test]
     fn load_a_book_with_a_single_chapter() {
         let (link, temp) = dummy_link();
-        let summary = Summary {
+        let mut summary = Summary {
             numbered_chapters: vec![SummaryItem::Link(link)],
             ..Default::default()
         };
@@ -475,13 +499,18 @@ And here is some \
                 name: String::from("Chapter 1"),
                 content: String::from(DUMMY_SRC),
                 path: Some(PathBuf::from("chapter_1.md")),
-                source_path: Some(PathBuf::from("chapter_1.md")),
+                source_path: Some(
+                    temp.path()
+                        .join(PathBuf::from("chapter_1.md"))
+                        .canonicalize()
+                        .unwrap(),
+                ),
                 ..Default::default()
             })],
             ..Default::default()
         };
 
-        let got = load_book_from_disk(&summary, temp.path()).unwrap();
+        let got = load_book_from_disk(&mut summary, temp.path()).unwrap();
 
         assert_eq!(got, should_be);
     }
@@ -523,12 +552,14 @@ And here is some \
                             "Hello World",
                             String::new(),
                             "Chapter_1/hello.md",
+                            "Chapter_1/hello.md",
                             Vec::new(),
                         )),
                         BookItem::Separator,
                         BookItem::Chapter(Chapter::new(
                             "Goodbye World",
                             String::new(),
+                            "Chapter_1/goodbye.md",
                             "Chapter_1/goodbye.md",
                             Vec::new(),
                         )),
@@ -576,12 +607,14 @@ And here is some \
                             "Hello World",
                             String::new(),
                             "Chapter_1/hello.md",
+                            "Chapter_1/hello.md",
                             Vec::new(),
                         )),
                         BookItem::Separator,
                         BookItem::Chapter(Chapter::new(
                             "Goodbye World",
                             String::new(),
+                            "Chapter_1/goodbye.md",
                             "Chapter_1/goodbye.md",
                             Vec::new(),
                         )),
@@ -603,7 +636,7 @@ And here is some \
     #[test]
     fn cant_load_chapters_with_an_empty_path() {
         let (_, temp) = dummy_link();
-        let summary = Summary {
+        let mut summary = Summary {
             numbered_chapters: vec![SummaryItem::Link(Link {
                 name: String::from("Empty"),
                 location: Some(PathBuf::from("")),
@@ -613,7 +646,7 @@ And here is some \
             ..Default::default()
         };
 
-        let got = load_book_from_disk(&summary, temp.path());
+        let got = load_book_from_disk(&mut summary, temp.path());
         assert!(got.is_err());
     }
 
@@ -623,7 +656,7 @@ And here is some \
         let dir = temp.path().join("nested");
         fs::create_dir(&dir).unwrap();
 
-        let summary = Summary {
+        let mut summary = Summary {
             numbered_chapters: vec![SummaryItem::Link(Link {
                 name: String::from("nested"),
                 location: Some(dir),
@@ -632,7 +665,7 @@ And here is some \
             ..Default::default()
         };
 
-        let got = load_book_from_disk(&summary, temp.path());
+        let got = load_book_from_disk(&mut summary, temp.path());
         assert!(got.is_err());
     }
 }
