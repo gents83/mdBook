@@ -13,10 +13,48 @@ pub fn normalize_path(path: &str) -> String {
         .collect::<String>()
 }
 
+pub(crate) fn canonicalize_path<P: AsRef<Path>>(path: &P) -> PathBuf {
+    let mut components = path.as_ref().components().peekable();
+    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
+        components.next();
+        PathBuf::from(c.as_os_str())
+    } else {
+        PathBuf::new()
+    };
+
+    for component in components {
+        match component {
+            Component::Prefix(..) => unreachable!(),
+            Component::RootDir => {
+                ret.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ret.pop();
+            }
+            Component::Normal(c) => {
+                ret.push(c);
+            }
+        }
+    }
+    ret
+}
+
 /// Write the given data to a file, creating it first if necessary
 pub fn write_file<P: AsRef<Path>>(build_dir: &Path, filename: P, content: &[u8]) -> Result<()> {
-    let path = build_dir.join(filename);
-
+    let src_dir = build_dir.parent().unwrap_or(build_dir).to_path_buf();
+    let build_dir = canonicalize_path(&build_dir);
+    let path = if let Ok(relative) =
+        make_relative_to(&build_dir, &canonicalize_path(&build_dir.join(&filename)))
+    {
+        build_dir.join(&relative)
+    } else if let Ok(relative) =
+        make_relative_to(&src_dir, &canonicalize_path(&src_dir.join(&filename)))
+    {
+        src_dir.join(&relative)
+    } else {
+        build_dir.join(&filename)
+    };
     create_file(&path)?.write_all(content).map_err(Into::into)
 }
 
@@ -239,6 +277,66 @@ pub fn get_404_output_file(input_404: &Option<String>) -> String {
         .as_ref()
         .unwrap_or(&"404.md".to_string())
         .replace(".md", ".html")
+}
+
+/// This will allow to make even external path relative to the current book position
+/// shortening to the most common root found between paths
+///
+/// So as example between 2 paths
+/// src:    root/a_folder/b_folder/c_folder/file.md
+/// other:  root/a_folder/d_folder/other.md
+/// result: d_folder/other.md
+///
+/// As example imagine to have following folder structure
+///
+/// root/
+/// root/my_folder/
+/// root/my_folder/doc/
+/// root/my_folder/doc/summary.md
+/// root/additional_doc/
+/// root/additional_doc/other.md
+/// root/additional_doc/nested/nested.md
+/// root/more_doc/
+/// root/more_doc/more.md
+///
+/// This will result in creating a book with following folder hierarchy:
+///
+/// root/my_folder/doc/book/summary.html
+/// root/my_folder/doc/book/additional_doc/other.md
+/// root/my_folder/doc/book/additional_doc/nested/nested.md
+/// root/my_folder/doc/book/more_doc/more.md
+///
+/// It's used both in book chapters and in summary links
+///
+pub(crate) fn make_relative_to<P1: AsRef<Path> + ?Sized, P2: AsRef<Path> + ?Sized>(
+    src: &P1,
+    other: &P2,
+) -> Result<PathBuf> {
+    let src_location = canonicalize_path(&src.as_ref());
+    let other_location = canonicalize_path(&other.as_ref());
+
+    if let Ok(stripped) = other_location.strip_prefix(&src_location) {
+        Ok(stripped.to_path_buf())
+    } else {
+        let src = src_location.to_str().unwrap_or_default().to_string();
+        let other = other_location.to_str().unwrap_or_default().to_string();
+        let src_path = src.to_string();
+        let mut other_path = other.to_string();
+        let mut index = 0;
+        let md_path_bytes = other_path.as_bytes();
+        let src_path_bytes = src_path.as_bytes();
+        while index < md_path_bytes.len() {
+            if index < src_path.len() && md_path_bytes[index] == src_path_bytes[index] {
+                index += 1;
+            } else {
+                break;
+            }
+        }
+        for _ in 0..index {
+            other_path.remove(0);
+        }
+        Ok(PathBuf::from(other_path.replace('\\', "/")))
+    }
 }
 
 #[cfg(test)]

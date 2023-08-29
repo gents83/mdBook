@@ -59,6 +59,7 @@ impl HtmlHandlebars {
 
         let fixed_content =
             utils::render_markdown_with_path(&ch.content, ctx.html_config.curly_quotes, Some(path));
+
         if !ctx.is_index && ctx.html_config.print.page_break {
             // Add page break between chapters
             // See https://developer.mozilla.org/en-US/docs/Web/CSS/break-before and https://developer.mozilla.org/en-US/docs/Web/CSS/page-break-before
@@ -110,11 +111,16 @@ impl HtmlHandlebars {
         debug!("Render template");
         let rendered = ctx.handlebars.render("index", &ctx.data)?;
 
-        let rendered = self.post_process(
+        let mut rendered = self.post_process(
             rendered,
             &ctx.html_config.playground,
             &ctx.html_config.code,
             ctx.edition,
+        );
+        utils::fix_extern_paths(
+            &mut rendered,
+            &ctx.destination,
+            ch.path.as_ref().unwrap_or(&PathBuf::from(".")),
         );
 
         // Write to file

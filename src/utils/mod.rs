@@ -4,6 +4,7 @@ pub mod fs;
 mod string;
 pub(crate) mod toml_ext;
 use crate::errors::Error;
+use crate::utils::fs::{canonicalize_path, make_relative_to};
 use log::error;
 use once_cell::sync::Lazy;
 use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag};
@@ -81,6 +82,29 @@ pub fn unique_id_from_content(content: &str, id_counter: &mut HashMap<String, us
     };
     *id_count += 1;
     unique_id
+}
+
+pub fn fix_extern_paths(content: &mut String, build_dir: &Path, _chapter_path: &Path) {
+    static HTML_LINK: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r#"(<(?:a|img) [^>]*?(?:src|href)=")([^"]+?)""#).unwrap());
+
+    *content = HTML_LINK
+        .replace_all(&content, |caps: &regex::Captures<'_>| {
+            let mut link: String = caps[2].into();
+            link = link.replace("%5C", "/");
+            link = link.replace("%20", " ");
+            let src_dir = build_dir.parent().unwrap_or(build_dir).to_path_buf();
+            let path = if let Ok(relative) =
+                make_relative_to(&src_dir, &canonicalize_path(&src_dir.join(&link)))
+            {
+                relative.to_str().unwrap().to_string()
+            } else {
+                link
+            };
+            format!("<a href=\"{}\"", path)
+        })
+        .into_owned()
+        .into();
 }
 
 /// Fix links to the correct location.
